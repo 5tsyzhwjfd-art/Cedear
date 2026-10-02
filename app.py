@@ -159,7 +159,27 @@ def fmt_pct(x):
 st.markdown('''
 <style>
     .stApp { background: #07111f; color: #eaf1fb; }
-    [data-testid="stMetric"] { background: #0d1b2d; border: 1px solid #20344d; padding: 14px; border-radius: 14px; }
+    .fx-strip {
+        display: grid; grid-template-columns: repeat(3, 1fr); gap: 0;
+        margin: 0.7rem 0 0.15rem 0; padding: 0.55rem 0;
+        border-top: 1px solid #16263a; border-bottom: 1px solid #16263a;
+    }
+    .fx-item { padding: 0 0.8rem; border-right: 1px solid #20344d; min-width: 0; }
+    .fx-item:first-child { padding-left: 0; }
+    .fx-item:last-child { border-right: 0; }
+    .fx-label { color: #9aabc0; font-size: 0.78rem; margin-bottom: 0.15rem; white-space: nowrap; }
+    .fx-line { display: flex; align-items: baseline; gap: 0.35rem; white-space: nowrap; }
+    .fx-value { color: #f3f7fd; font-size: 1.12rem; font-weight: 700; }
+    .fx-up { color: #22c96b; font-size: 0.78rem; font-weight: 600; }
+    .fx-down { color: #ff5a55; font-size: 0.78rem; font-weight: 600; }
+    .updated { color: #8ea2bb; font-size: 0.72rem; margin: 0.15rem 0 0.65rem 0; }
+    @media (max-width: 640px) {
+        .fx-item { padding: 0 0.42rem; }
+        .fx-label { font-size: 0.66rem; }
+        .fx-value { font-size: 0.91rem; }
+        .fx-up, .fx-down { font-size: 0.63rem; }
+        .updated { font-size: 0.65rem; }
+    }
     [data-testid="stDataFrame"] { border: 1px solid #20344d; border-radius: 14px; overflow: hidden; }
     .muted { color: #8ea2bb; font-size: 0.9rem; }
     .status { padding: 8px 12px; border-radius: 10px; background: #10243a; display:inline-block; }
@@ -178,11 +198,35 @@ with right:
 df, ccl, ccl_change, official, ccl_source, official_source, all_live = build_dashboard()
 brecha = (ccl / official - 1) * 100 if official else None
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric('CCL referencia', fmt_ars(ccl), fmt_pct(ccl_change))
-m2.metric('Dólar oficial', fmt_ars(official))
-m3.metric('Brecha CCL / oficial', fmt_pct(brecha))
-m4.metric('Actualización', datetime.now(TZ).strftime('%H:%M'))
+# Compact FX header: three indicators on one row, timestamp below.
+def delta_html(value):
+    if value is None:
+        return ''
+    css = 'fx-up' if value >= 0 else 'fx-down'
+    arrow = '↑' if value >= 0 else '↓'
+    return f'<span class="{css}">{arrow} {fmt_pct(value)}</span>'
+
+updated_at = datetime.now(TZ)
+st.markdown(
+    f'''
+    <div class="fx-strip">
+      <div class="fx-item">
+        <div class="fx-label">CCL referencia</div>
+        <div class="fx-line"><span class="fx-value">{fmt_ars(ccl)}</span>{delta_html(ccl_change)}</div>
+      </div>
+      <div class="fx-item">
+        <div class="fx-label">Dólar oficial</div>
+        <div class="fx-line"><span class="fx-value">{fmt_ars(official)}</span></div>
+      </div>
+      <div class="fx-item">
+        <div class="fx-label">Brecha</div>
+        <div class="fx-line"><span class="fx-value">{fmt_pct(brecha)}</span></div>
+      </div>
+    </div>
+    <div class="updated">Actualizado: {updated_at.strftime('%d/%m/%Y · %H:%M')}</div>
+    ''',
+    unsafe_allow_html=True,
+)
 
 if all_live:
     st.success('Datos conectados a fuentes en vivo.')
