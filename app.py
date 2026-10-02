@@ -17,10 +17,23 @@ TZ = ZoneInfo('America/Argentina/Buenos_Aires')
 
 # Ratios validated for the initial prototype.
 INSTRUMENTS = {
-    'AAPL': {'ratio': 20, 'name': 'Apple'},
-    'NVDA': {'ratio': 24, 'name': 'NVIDIA'},
-    'SPY': {'ratio': 60, 'name': 'SPDR S&P 500 ETF'},
+    'AAPL': {'ratio': 20, 'name': 'Apple'}, 'NVDA': {'ratio': 24, 'name': 'NVIDIA'},
+    'SPY': {'ratio': 60, 'name': 'SPDR S&P 500 ETF'}, 'AMZN': {'ratio': 143, 'name': 'Amazon'},
+    'TSLA': {'ratio': 15, 'name': 'Tesla'}, 'MSFT': {'ratio': 30, 'name': 'Microsoft'},
+    'GOOGL': {'ratio': 58, 'name': 'Alphabet'}, 'META': {'ratio': 24, 'name': 'Meta'},
+    'AMD': {'ratio': 10, 'name': 'AMD'}, 'MELI': {'ratio': 120, 'name': 'MercadoLibre'},
+    'KO': {'ratio': 5, 'name': 'Coca-Cola'}, 'QQQ': {'ratio': 20, 'name': 'Invesco QQQ'},
+    'BRKB': {'ratio': 22, 'name': 'Berkshire Hathaway'}, 'JPM': {'ratio': 15, 'name': 'JPMorgan'},
+    'V': {'ratio': 18, 'name': 'Visa'}, 'WMT': {'ratio': 18, 'name': 'Walmart'},
+    'XOM': {'ratio': 10, 'name': 'Exxon Mobil'}, 'DIS': {'ratio': 12, 'name': 'Disney'},
+    'NFLX': {'ratio': 48, 'name': 'Netflix'}, 'BABA': {'ratio': 9, 'name': 'Alibaba'},
+    'INTC': {'ratio': 5, 'name': 'Intel'}, 'PFE': {'ratio': 4, 'name': 'Pfizer'},
+    'BA': {'ratio': 24, 'name': 'Boeing'}, 'NKE': {'ratio': 12, 'name': 'Nike'},
+    'PYPL': {'ratio': 8, 'name': 'PayPal'}, 'AVGO': {'ratio': 39, 'name': 'Broadcom'},
 }
+
+# Seed values only exist for the original validation trio. Other symbols are
+# omitted gracefully until a live/local source returns them.
 
 # Demo fallbacks keep the UI usable if a public endpoint changes or a key is absent.
 # The dashboard explicitly labels fallback/demo values.
@@ -63,8 +76,10 @@ def get_usa_quote(symbol):
             return price, change, 'Twelve Data', True
         except Exception:
             pass
-    f = FALLBACK[symbol]
-    return f['usa'], f['usa_change'], 'Fallback validación', False
+    f = FALLBACK.get(symbol)
+    if f:
+        return f['usa'], f['usa_change'], 'Fallback validación', False
+    return None, None, 'Sin dato USA', False
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
@@ -99,8 +114,29 @@ def get_ccl_reference():
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_cedear_quote(symbol):
     """V1 local-market adapter. Uses validated fallback until a stable public feed is wired."""
-    f = FALLBACK[symbol]
-    return f['cedear'], f['cedear_change'], 'Fuente local validada / fallback', False
+    # Data912 exposes a public CEDEAR live endpoint including price, volume and daily change.
+    try:
+        data = safe_get_json('https://data912.com/live/arg_cedears')
+        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
+        for item in items:
+            if str(item.get('symbol', '')).upper() == symbol:
+                return float(item['c']), float(item.get('pct_change', 0) or 0), 'Data912', True
+    except Exception:
+        pass
+    f = FALLBACK.get(symbol)
+    if f:
+        return f['cedear'], f['cedear_change'], 'Fallback validación', False
+    return None, None, 'Sin dato local', False
+
+
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def get_local_market_snapshot():
+    try:
+        data = safe_get_json('https://data912.com/live/arg_cedears')
+        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
+        return {str(x.get('symbol','')).upper(): x for x in items}
+    except Exception:
+        return {}
 
 
 def build_dashboard():
@@ -108,18 +144,26 @@ def build_dashboard():
     official, official_source, official_live = get_official_fx()
     rows = []
     all_live = ccl_live and official_live
+    market = get_local_market_snapshot()
 
-    for symbol, meta in INSTRUMENTS.items():
+    # Rank the supported universe by current traded amount (price × volume).
+    # This is a live liquidity proxy; a true 30-session average requires historical BYMA/EOD access.
+    ranked = sorted(INSTRUMENTS.items(), key=lambda kv: float(market.get(kv[0], {}).get('c', 0) or 0) * float(market.get(kv[0], {}).get('v', 0) or 0), reverse=True)
+    selected = ranked[:20] if market else list(INSTRUMENTS.items())[:20]
+
+    for symbol, meta in selected:
         usa, usa_change, usa_source, usa_live = get_usa_quote(symbol)
         cedear, cedear_change, cedear_source, cedear_live = get_cedear_quote(symbol)
         ratio = meta['ratio']
 
-        theoretical = usa * ccl / ratio
-        deviation = (cedear / theoretical - 1) * 100 if theoretical else None
-        implied_ccl = cedear * ratio / usa if usa else None
-
-        # Exact relationship from relative price changes, not simple subtraction.
-        implied_ccl_change = ((1 + cedear_change / 100) / (1 + usa_change / 100) - 1) * 100
+        theoretical = usa * ccl / ratio if usa is not None else None
+        deviation = (cedear / theoretical - 1) * 100 if theoretical and cedear is not None else None
+        implied_ccl = cedear * ratio / usa if usa and cedear is not None else None
+        implied_ccl_change = (((1 + cedear_change / 100) / (1 + usa_change / 100) - 1) * 100
+                              if cedear_change is not None and usa_change is not None else None)
+        md = market.get(symbol, {})
+        volume = float(md.get('v', 0) or 0)
+        traded_amount = float(md.get('c', 0) or 0) * volume
 
         rows.append({
             'CEDEAR': symbol,
@@ -132,6 +176,8 @@ def build_dashboard():
             'Var. USA': usa_change,
             'Var. CEDEAR': cedear_change,
             'Var. CCL impl.': implied_ccl_change,
+            'Volumen': volume,
+            'Monto operado': traded_amount,
             '_source_usa': usa_source,
             '_source_cedear': cedear_source,
             '_live': usa_live and cedear_live,
@@ -159,6 +205,10 @@ def fmt_pct(x):
 st.markdown('''
 <style>
     .stApp { background: #07111f; color: #eaf1fb; }
+    .block-container {max-width: 1180px; padding-top: 1.35rem; padding-bottom: 2rem;}
+    .hero-title {font-size: 2rem; font-weight: 800; letter-spacing: -0.04em; color:#f4f7fb; margin-bottom:.05rem;}
+    h3 {font-size:1.05rem !important; margin-top:.75rem !important;}
+    div[data-testid="stTextInput"] input {background:#0b1727; border:1px solid #20344d; border-radius:10px;}
     .fx-strip {
         display: grid; grid-template-columns: repeat(3, 1fr); gap: 0;
         margin: 0.7rem 0 0.15rem 0; padding: 0.55rem 0;
@@ -180,7 +230,9 @@ st.markdown('''
         .fx-up, .fx-down { font-size: 0.63rem; }
         .updated { font-size: 0.65rem; }
     }
-    [data-testid="stDataFrame"] { border: 1px solid #20344d; border-radius: 14px; overflow: hidden; }
+    [data-testid="stDataFrame"] { border: 1px solid #20344d; border-radius: 12px; overflow: hidden; }
+    [data-testid="stDataFrame"] * {font-size: .82rem;}
+    @media (max-width:640px){.block-container{padding-left:.7rem;padding-right:.7rem;padding-top:.8rem}.hero-title{font-size:1.55rem}}
     .muted { color: #8ea2bb; font-size: 0.9rem; }
     .status { padding: 8px 12px; border-radius: 10px; background: #10243a; display:inline-block; }
 </style>
@@ -188,7 +240,7 @@ st.markdown('''
 
 left, right = st.columns([4, 1])
 with left:
-    st.title('📈 CEDEAR Monitor')
+    st.markdown('<div class="hero-title">CEDEAR Monitor</div>', unsafe_allow_html=True)
     st.caption('Comparación objetiva entre CEDEARs y sus activos subyacentes en EE.UU.')
 with right:
     if st.button('↻ Actualizar ahora', use_container_width=True):
@@ -233,7 +285,7 @@ if all_live:
 else:
     st.info('Modo V1 híbrido: las fuentes disponibles se consultan en vivo; donde no hay un endpoint público estable se muestran los valores de validación. La app identifica esta condición para evitar presentar un fallback como dato en vivo.')
 
-st.subheader('CEDEARs')
+st.subheader('Top 20 CEDEARs por liquidez')
 
 search = st.text_input('Buscar ticker', placeholder='AAPL, NVDA, SPY…', label_visibility='collapsed').upper().strip()
 view = df.copy()
@@ -243,7 +295,7 @@ if search:
 # User-agreed column order.
 visible = view[[
     'CEDEAR', 'Ratio', 'Acción USA', 'CEDEAR real', 'CEDEAR teórico',
-    'Desvío real/teórico', 'CCL implícito', 'Var. USA', 'Var. CEDEAR', 'Var. CCL impl.'
+    'Desvío real/teórico', 'CCL implícito', 'Var. USA', 'Var. CEDEAR', 'Volumen'
 ]]
 
 st.dataframe(
@@ -260,11 +312,11 @@ st.dataframe(
         'CCL implícito': st.column_config.NumberColumn('CCL implícito', format='$ %.2f'),
         'Var. USA': st.column_config.NumberColumn('Var. USA', format='%+.2f%%'),
         'Var. CEDEAR': st.column_config.NumberColumn('Var. CEDEAR', format='%+.2f%%'),
-        'Var. CCL impl.': st.column_config.NumberColumn('Var. CCL impl.', format='%+.2f%%'),
+        'Volumen': st.column_config.NumberColumn('Volumen', format='%.0f'),
     },
 )
 
-st.caption(f'CCL: {ccl_source} · Oficial: {official_source} · refresco de caché: 30 min')
+st.caption(f'CCL: {ccl_source} · Oficial: {official_source} · actualización automática: 30 min · ranking gratuito: liquidez intradiaria')
 
 with st.expander('Cómo se calculan las métricas'):
     st.markdown('''
