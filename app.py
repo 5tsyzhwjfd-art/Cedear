@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
+from html import escape
 
 st.set_page_config(page_title='CEDEAR Monitor', page_icon='📈', layout='wide')
 
@@ -64,7 +65,11 @@ def pct_change_from_prices(current, previous):
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_usa_quote(symbol):
-    """Twelve Data primary. Returns (price, pct_change, source, live)."""
+    """USA quote: Twelve Data first (if configured), Yahoo Chart as keyless backup.
+
+    Yahoo's chart endpoint is an unofficial/recent quote source and can be delayed.
+    Returns (price, pct_change, source, live_or_recent).
+    """
     if TWELVE_DATA_KEY:
         try:
             data = safe_get_json(
@@ -76,6 +81,34 @@ def get_usa_quote(symbol):
             return price, change, 'Twelve Data', True
         except Exception:
             pass
+
+    # Yahoo uses BRK-B while the local CEDEAR is commonly represented as BRKB.
+    yahoo_symbol = {'BRKB': 'BRK-B'}.get(symbol, symbol)
+    try:
+        data = safe_get_json(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}',
+            {'range': '5d', 'interval': '1d', 'includePrePost': 'false'},
+        )
+        result = data['chart']['result'][0]
+        meta = result.get('meta', {})
+        price = meta.get('regularMarketPrice')
+        previous = meta.get('chartPreviousClose') or meta.get('previousClose')
+
+        # If meta lacks a previous close, derive it from the last two valid closes.
+        closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
+        valid_closes = [float(x) for x in closes if x is not None]
+        if previous is None and len(valid_closes) >= 2:
+            previous = valid_closes[-2]
+        if price is None and valid_closes:
+            price = valid_closes[-1]
+
+        if price is not None:
+            price = float(price)
+            change = pct_change_from_prices(price, float(previous)) if previous else None
+            return price, change, 'Yahoo Finance (reciente)', True
+    except Exception:
+        pass
+
     f = FALLBACK.get(symbol)
     if f:
         return f['usa'], f['usa_change'], 'Fallback validación', False
@@ -153,7 +186,17 @@ def build_dashboard():
 
     for symbol, meta in selected:
         usa, usa_change, usa_source, usa_live = get_usa_quote(symbol)
-        cedear, cedear_change, cedear_source, cedear_live = get_cedear_quote(symbol)
+        md = market.get(symbol, {})
+        try:
+            cedear = float(md.get('c')) if md.get('c') is not None else None
+            cedear_change = float(md.get('pct_change', 0) or 0) if cedear is not None else None
+            cedear_source, cedear_live = ('Data912', True) if cedear is not None else ('Sin dato local', False)
+        except (TypeError, ValueError):
+            cedear, cedear_change, cedear_source, cedear_live = None, None, 'Sin dato local', False
+        if cedear is None and symbol in FALLBACK:
+            f = FALLBACK[symbol]
+            cedear, cedear_change = f['cedear'], f['cedear_change']
+            cedear_source, cedear_live = 'Fallback validación', False
         ratio = meta['ratio']
 
         theoretical = usa * ccl / ratio if usa is not None else None
@@ -161,7 +204,6 @@ def build_dashboard():
         implied_ccl = cedear * ratio / usa if usa and cedear is not None else None
         implied_ccl_change = (((1 + cedear_change / 100) / (1 + usa_change / 100) - 1) * 100
                               if cedear_change is not None and usa_change is not None else None)
-        md = market.get(symbol, {})
         volume = float(md.get('v', 0) or 0)
         traded_amount = float(md.get('c', 0) or 0) * volume
 
@@ -230,8 +272,22 @@ st.markdown('''
         .fx-up, .fx-down { font-size: 0.63rem; }
         .updated { font-size: 0.65rem; }
     }
-    [data-testid="stDataFrame"] { border: 1px solid #20344d; border-radius: 12px; overflow: hidden; }
-    [data-testid="stDataFrame"] * {font-size: .82rem;}
+    .table-shell {border:1px solid #20344d; border-radius:14px; overflow:auto; background:#081522; box-shadow:0 10px 28px rgba(0,0,0,.18);}
+    .cedear-table {width:100%; min-width:1040px; border-collapse:separate; border-spacing:0; font-size:.82rem;}
+    .cedear-table th {position:sticky; top:0; z-index:2; background:#0d2237; color:#c9d6e6; font-size:.72rem; font-weight:700; text-transform:none; padding:11px 10px; border-bottom:1px solid #29425f; text-align:right; white-space:nowrap;}
+    .cedear-table th:first-child {left:0; z-index:3; text-align:left;}
+    .cedear-table td {padding:10px; border-bottom:1px solid #15283b; text-align:right; color:#e8eef7; white-space:nowrap; background:#081522;}
+    .cedear-table tr:last-child td {border-bottom:0;}
+    .cedear-table tbody tr:hover td {background:#0b1c2c;}
+    .cedear-table td:first-child {position:sticky; left:0; z-index:1; text-align:left; font-weight:800; color:#f5f8fc; background:#081522;}
+    .ticker-cell {display:flex; align-items:center; gap:8px;}
+    .ticker-dot {width:7px; height:7px; border-radius:50%; background:#2d8cff; box-shadow:0 0 10px rgba(45,140,255,.7); flex:0 0 auto;}
+    .num-muted {color:#8da0b7;}
+    .pill {display:inline-block; min-width:68px; padding:5px 8px; border-radius:7px; font-weight:800; text-align:center;}
+    .pill-pos {color:#ffb0ad; background:linear-gradient(180deg,#632326,#45191d); border:1px solid #743036;}
+    .pill-neg {color:#71e6a5; background:linear-gradient(180deg,#0b5738,#073b28); border:1px solid #126746;}
+    .pct-pos {color:#45d986; font-weight:700;} .pct-neg {color:#ff6b65; font-weight:700;}
+    @media (max-width:640px){.cedear-table{font-size:.76rem;min-width:980px}.cedear-table th{font-size:.66rem;padding:9px 8px}.cedear-table td{padding:9px 8px}.table-shell{border-radius:12px}}
     @media (max-width:640px){.block-container{padding-left:.7rem;padding-right:.7rem;padding-top:.8rem}.hero-title{font-size:1.55rem}}
     .muted { color: #8ea2bb; font-size: 0.9rem; }
     .status { padding: 8px 12px; border-radius: 10px; background: #10243a; display:inline-block; }
@@ -292,28 +348,48 @@ view = df.copy()
 if search:
     view = view[view['CEDEAR'].str.contains(search, regex=False)]
 
-# User-agreed column order.
-visible = view[[
-    'CEDEAR', 'Ratio', 'Acción USA', 'CEDEAR real', 'CEDEAR teórico',
-    'Desvío real/teórico', 'CCL implícito', 'Var. USA', 'Var. CEDEAR', 'Volumen'
-]]
+# User-agreed column order, rendered as a compact financial table matching the approved mockup.
+def cell_money(x, usd=False):
+    if pd.isna(x):
+        return '<span class="num-muted">—</span>'
+    if usd:
+        return f'US$ {x:,.2f}'
+    return f'$ {x:,.0f}'.replace(',', '.')
 
-st.dataframe(
-    visible,
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        'CEDEAR': st.column_config.TextColumn('CEDEAR', pinned=True),
-        'Ratio': st.column_config.TextColumn('Ratio'),
-        'Acción USA': st.column_config.NumberColumn('Acción USA', format='US$ %.2f'),
-        'CEDEAR real': st.column_config.NumberColumn('CEDEAR real', format='$ %.2f'),
-        'CEDEAR teórico': st.column_config.NumberColumn('CEDEAR teórico', format='$ %.2f'),
-        'Desvío real/teórico': st.column_config.NumberColumn('Desvío real/teórico', format='%+.2f%%'),
-        'CCL implícito': st.column_config.NumberColumn('CCL implícito', format='$ %.2f'),
-        'Var. USA': st.column_config.NumberColumn('Var. USA', format='%+.2f%%'),
-        'Var. CEDEAR': st.column_config.NumberColumn('Var. CEDEAR', format='%+.2f%%'),
-        'Volumen': st.column_config.NumberColumn('Volumen', format='%.0f'),
-    },
+def cell_pct(x, pill=False):
+    if pd.isna(x):
+        return '<span class="num-muted">—</span>'
+    cls = ('pill pill-pos' if x >= 0 else 'pill pill-neg') if pill else ('pct-pos' if x >= 0 else 'pct-neg')
+    txt = f'{x:+.2f}%'.replace('.', ',')
+    return f'<span class="{cls}">{txt}</span>'
+
+def cell_number(x):
+    if pd.isna(x):
+        return '<span class="num-muted">—</span>'
+    return f'{x:,.0f}'.replace(',', '.')
+
+headers = ['CEDEAR','Ratio','Acción USA','CEDEAR real','Teórico','Desvío','CCL implícito','Var. USA','Var. CEDEAR','Volumen']
+rows_html = []
+for _, r in view.iterrows():
+    rows_html.append(
+        '<tr>'
+        f'<td><div class="ticker-cell"><span class="ticker-dot"></span>{escape(str(r["CEDEAR"]))}</div></td>'
+        f'<td>{escape(str(r["Ratio"]))}</td>'
+        f'<td>{cell_money(r["Acción USA"], usd=True)}</td>'
+        f'<td>{cell_money(r["CEDEAR real"])}</td>'
+        f'<td>{cell_money(r["CEDEAR teórico"])}</td>'
+        f'<td>{cell_pct(r["Desvío real/teórico"], pill=True)}</td>'
+        f'<td>{cell_money(r["CCL implícito"])}</td>'
+        f'<td>{cell_pct(r["Var. USA"])}</td>'
+        f'<td>{cell_pct(r["Var. CEDEAR"])}</td>'
+        f'<td>{cell_number(r["Volumen"])}</td>'
+        '</tr>'
+    )
+head_html = ''.join(f'<th>{h}</th>' for h in headers)
+st.markdown(
+    '<div class="table-shell"><table class="cedear-table"><thead><tr>' + head_html +
+    '</tr></thead><tbody>' + ''.join(rows_html) + '</tbody></table></div>',
+    unsafe_allow_html=True,
 )
 
 st.caption(f'CCL: {ccl_source} · Oficial: {official_source} · actualización automática: 30 min · ranking gratuito: liquidez intradiaria')
