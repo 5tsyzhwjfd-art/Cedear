@@ -1,5 +1,7 @@
 import os
 import time
+import json
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -36,15 +38,14 @@ INSTRUMENTS = {
 # Seed values only exist for the original validation trio. Other symbols are
 # omitted gracefully until a live/local source returns them.
 
-# Demo fallbacks keep the UI usable if a public endpoint changes or a key is absent.
-# The dashboard explicitly labels fallback/demo values.
+# No fixed market-price fallbacks: stale demo prices can be mistaken for live data.
+# Last valid observations are retained instead.
 FALLBACK = {
     'ccl': {'price': 1623.00, 'change': 0.65},
     'official': {'price': 1400.00},
-    'AAPL': {'usa': 330.32, 'usa_change': -0.81, 'cedear': 26840.0, 'cedear_change': -0.59},
-    'NVDA': {'usa': 230.86, 'usa_change': 1.09, 'cedear': 15700.0, 'cedear_change': 1.74},
-    'SPY': {'usa': 763.99, 'usa_change': 0.18, 'cedear': 20720.0, 'cedear_change': 0.68},
 }
+
+LAST_GOOD_FILE = Path('/tmp/cedear_monitor_last_good.json')
 
 TWELVE_DATA_KEY = st.secrets.get('TWELVE_DATA_API_KEY', os.getenv('TWELVE_DATA_API_KEY', ''))
 
@@ -64,25 +65,27 @@ def pct_change_from_prices(current, previous):
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_usa_quote(symbol):
-    """USA quote: Twelve Data first (if configured), Yahoo Chart as keyless backup.
+def get_usa_market_snapshot():
+    """Secondary USA feed from Data912. One request covers the supported universe."""
+    try:
+        data = safe_get_json('https://data912.com/live/usa_stocks')
+        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
+        return {str(x.get('symbol', '')).upper(): x for x in items}
+    except Exception:
+        return {}
 
-    Yahoo's chart endpoint is an unofficial/recent quote source and can be delayed.
-    Returns (price, pct_change, source, live_or_recent).
-    """
+
+def get_usa_quote(symbol, usa_snapshot=None):
+    """USA quote with automatic redundancy: Twelve Data -> Yahoo -> Data912."""
     if TWELVE_DATA_KEY:
         try:
-            data = safe_get_json(
-                'https://api.twelvedata.com/quote',
-                {'symbol': symbol, 'apikey': TWELVE_DATA_KEY},
-            )
+            data = safe_get_json('https://api.twelvedata.com/quote', {'symbol': symbol, 'apikey': TWELVE_DATA_KEY})
             price = float(data['close'])
             change = float(data['percent_change'])
             return price, change, 'Twelve Data', True
         except Exception:
             pass
 
-    # Yahoo uses BRK-B while the local CEDEAR is commonly represented as BRKB.
     yahoo_symbol = {'BRKB': 'BRK-B'}.get(symbol, symbol)
     try:
         data = safe_get_json(
@@ -93,25 +96,27 @@ def get_usa_quote(symbol):
         meta = result.get('meta', {})
         price = meta.get('regularMarketPrice')
         previous = meta.get('chartPreviousClose') or meta.get('previousClose')
-
-        # If meta lacks a previous close, derive it from the last two valid closes.
         closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
         valid_closes = [float(x) for x in closes if x is not None]
         if previous is None and len(valid_closes) >= 2:
             previous = valid_closes[-2]
         if price is None and valid_closes:
             price = valid_closes[-1]
-
         if price is not None:
             price = float(price)
             change = pct_change_from_prices(price, float(previous)) if previous else None
-            return price, change, 'Yahoo Finance (reciente)', True
+            return price, change, 'Yahoo Finance', True
     except Exception:
         pass
 
-    f = FALLBACK.get(symbol)
-    if f:
-        return f['usa'], f['usa_change'], 'Fallback validación', False
+    item = (usa_snapshot or {}).get(symbol, {})
+    try:
+        price = float(item.get('c')) if item.get('c') is not None else None
+        if price is not None:
+            change = float(item.get('pct_change', 0) or 0)
+            return price, change, 'Data912 USA', True
+    except (TypeError, ValueError):
+        pass
     return None, None, 'Sin dato USA', False
 
 
@@ -145,24 +150,6 @@ def get_ccl_reference():
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_cedear_quote(symbol):
-    """V1 local-market adapter. Uses validated fallback until a stable public feed is wired."""
-    # Data912 exposes a public CEDEAR live endpoint including price, volume and daily change.
-    try:
-        data = safe_get_json('https://data912.com/live/arg_cedears')
-        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
-        for item in items:
-            if str(item.get('symbol', '')).upper() == symbol:
-                return float(item['c']), float(item.get('pct_change', 0) or 0), 'Data912', True
-    except Exception:
-        pass
-    f = FALLBACK.get(symbol)
-    if f:
-        return f['cedear'], f['cedear_change'], 'Fallback validación', False
-    return None, None, 'Sin dato local', False
-
-
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_local_market_snapshot():
     try:
         data = safe_get_json('https://data912.com/live/arg_cedears')
@@ -172,33 +159,150 @@ def get_local_market_snapshot():
         return {}
 
 
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def get_cedear_yahoo_quote(symbol):
+    """Independent local backup via Yahoo's Buenos Aires (.BA) listing."""
+    try:
+        data = safe_get_json(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.BA',
+            {'range': '5d', 'interval': '1d', 'includePrePost': 'false'},
+        )
+        result = data['chart']['result'][0]
+        meta = result.get('meta', {})
+        price = meta.get('regularMarketPrice')
+        previous = meta.get('chartPreviousClose') or meta.get('previousClose')
+        closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
+        valid = [float(x) for x in closes if x is not None]
+        if price is None and valid:
+            price = valid[-1]
+        if previous is None and len(valid) >= 2:
+            previous = valid[-2]
+        if price is not None:
+            price = float(price)
+            change = pct_change_from_prices(price, float(previous)) if previous else None
+            return price, change
+    except Exception:
+        pass
+    return None, None
+
+
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def get_cedear_historical_last(symbol):
+    """Secondary local source: last available historical CEDEAR close from Data912."""
+    try:
+        data = safe_get_json(f'https://data912.com/historical/cedears/{symbol}')
+        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
+        if not items:
+            return None, None
+        item = items[-1]
+        price = item.get('c') or item.get('close')
+        if price is None:
+            return None, None
+        change = item.get('pct_change')
+        return float(price), float(change) if change is not None else None
+    except Exception:
+        return None, None
+
+
+def load_last_good():
+    if 'last_good_market' in st.session_state:
+        return st.session_state.last_good_market
+    try:
+        data = json.loads(LAST_GOOD_FILE.read_text())
+    except Exception:
+        data = {'usa': {}, 'cedear': {}}
+    st.session_state.last_good_market = data
+    return data
+
+
+def save_last_good(data):
+    st.session_state.last_good_market = data
+    try:
+        LAST_GOOD_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
+def remember_quote(store, market, symbol, price, change, source, now_iso):
+    if price is not None:
+        store.setdefault(market, {})[symbol] = {
+            'price': price, 'change': change, 'source': source, 'timestamp': now_iso
+        }
+
+
+def recover_quote(store, market, symbol):
+    item = store.get(market, {}).get(symbol)
+    if not item:
+        return None, None, None, None
+    return item.get('price'), item.get('change'), item.get('source'), item.get('timestamp')
+
+
 def build_dashboard():
     ccl, ccl_change, ccl_source, ccl_live = get_ccl_reference()
     official, official_source, official_live = get_official_fx()
     rows = []
-    all_live = ccl_live and official_live
     market = get_local_market_snapshot()
+    usa_snapshot = get_usa_market_snapshot()
+    store = load_last_good()
+    now = datetime.now(TZ)
+    now_iso = now.isoformat()
+    displayed_timestamps = []
+    using_stale = False
 
-    # Rank the supported universe by current traded amount (price × volume).
-    # This is a live liquidity proxy; a true 30-session average requires historical BYMA/EOD access.
-    ranked = sorted(INSTRUMENTS.items(), key=lambda kv: float(market.get(kv[0], {}).get('c', 0) or 0) * float(market.get(kv[0], {}).get('v', 0) or 0), reverse=True)
+    ranked = sorted(
+        INSTRUMENTS.items(),
+        key=lambda kv: float(market.get(kv[0], {}).get('c', 0) or 0) * float(market.get(kv[0], {}).get('v', 0) or 0),
+        reverse=True,
+    )
     selected = ranked[:20] if market else list(INSTRUMENTS.items())[:20]
 
     for symbol, meta in selected:
-        usa, usa_change, usa_source, usa_live = get_usa_quote(symbol)
+        usa, usa_change, usa_source, usa_live = get_usa_quote(symbol, usa_snapshot)
+        usa_ts = None
+        if usa is not None:
+            remember_quote(store, 'usa', symbol, usa, usa_change, usa_source, now_iso)
+            usa_ts = now_iso
+        else:
+            usa, usa_change, old_source, usa_ts = recover_quote(store, 'usa', symbol)
+            if usa is not None:
+                usa_source = f'Último válido · {old_source}'
+                using_stale = True
+
         md = market.get(symbol, {})
         try:
             cedear = float(md.get('c')) if md.get('c') is not None else None
             cedear_change = float(md.get('pct_change', 0) or 0) if cedear is not None else None
-            cedear_source, cedear_live = ('Data912', True) if cedear is not None else ('Sin dato local', False)
         except (TypeError, ValueError):
-            cedear, cedear_change, cedear_source, cedear_live = None, None, 'Sin dato local', False
-        if cedear is None and symbol in FALLBACK:
-            f = FALLBACK[symbol]
-            cedear, cedear_change = f['cedear'], f['cedear_change']
-            cedear_source, cedear_live = 'Fallback validación', False
-        ratio = meta['ratio']
+            cedear, cedear_change = None, None
+        cedear_source = 'Data912 live' if cedear is not None else 'Sin dato local'
+        cedear_ts = None
+        if cedear is None:
+            yahoo_local, yahoo_local_change = get_cedear_yahoo_quote(symbol)
+            if yahoo_local is not None:
+                cedear, cedear_change = yahoo_local, yahoo_local_change
+                cedear_source = 'Yahoo Finance .BA'
+        if cedear is None:
+            hist_price, hist_change = get_cedear_historical_last(symbol)
+            if hist_price is not None:
+                cedear, cedear_change = hist_price, hist_change
+                cedear_source = 'Data912 histórico'
+        if cedear is not None:
+            remember_quote(store, 'cedear', symbol, cedear, cedear_change, cedear_source, now_iso)
+            cedear_ts = now_iso
+        else:
+            cedear, cedear_change, old_source, cedear_ts = recover_quote(store, 'cedear', symbol)
+            if cedear is not None:
+                cedear_source = f'Último válido · {old_source}'
+                using_stale = True
 
+        for ts in (usa_ts, cedear_ts):
+            if ts:
+                try:
+                    displayed_timestamps.append(datetime.fromisoformat(ts))
+                except Exception:
+                    pass
+
+        ratio = meta['ratio']
         theoretical = usa * ccl / ratio if usa is not None else None
         deviation = (cedear / theoretical - 1) * 100 if theoretical and cedear is not None else None
         implied_ccl = cedear * ratio / usa if usa and cedear is not None else None
@@ -208,25 +312,18 @@ def build_dashboard():
         traded_amount = float(md.get('c', 0) or 0) * volume
 
         rows.append({
-            'CEDEAR': symbol,
-            'Ratio': f'{ratio}:1',
-            'Acción USA': usa,
-            'CEDEAR real': cedear,
-            'CEDEAR teórico': theoretical,
-            'Desvío real/teórico': deviation,
-            'CCL implícito': implied_ccl,
-            'Var. USA': usa_change,
-            'Var. CEDEAR': cedear_change,
-            'Var. CCL impl.': implied_ccl_change,
-            'Volumen': volume,
-            'Monto operado': traded_amount,
-            '_source_usa': usa_source,
-            '_source_cedear': cedear_source,
-            '_live': usa_live and cedear_live,
+            'CEDEAR': symbol, 'Ratio': f'{ratio}:1', 'Acción USA': usa, 'CEDEAR real': cedear,
+            'CEDEAR teórico': theoretical, 'Desvío real/teórico': deviation, 'CCL implícito': implied_ccl,
+            'Var. USA': usa_change, 'Var. CEDEAR': cedear_change, 'Var. CCL impl.': implied_ccl_change,
+            'Volumen': volume, 'Monto operado': traded_amount, '_source_usa': usa_source,
+            '_source_cedear': cedear_source, '_live': usa_live and cedear_source == 'Data912 live',
         })
-        all_live = all_live and usa_live and cedear_live
 
-    return pd.DataFrame(rows), ccl, ccl_change, official, ccl_source, official_source, all_live
+    save_last_good(store)
+    # Conservative global timestamp: oldest observation currently used in the table.
+    # It never advances merely because Streamlit reran; only a successful market observation changes it.
+    data_timestamp = min(displayed_timestamps) if displayed_timestamps else None
+    return pd.DataFrame(rows), ccl, ccl_change, official, ccl_source, official_source, using_stale, data_timestamp
 
 
 def fmt_ars(x):
@@ -303,7 +400,7 @@ with right:
         st.cache_data.clear()
         st.rerun()
 
-df, ccl, ccl_change, official, ccl_source, official_source, all_live = build_dashboard()
+df, ccl, ccl_change, official, ccl_source, official_source, using_stale, data_timestamp = build_dashboard()
 brecha = (ccl / official - 1) * 100 if official else None
 
 # Compact FX header: three indicators on one row, timestamp below.
@@ -314,7 +411,7 @@ def delta_html(value):
     arrow = '↑' if value >= 0 else '↓'
     return f'<span class="{css}">{arrow} {fmt_pct(value)}</span>'
 
-updated_at = datetime.now(TZ)
+updated_at = data_timestamp
 st.markdown(
     f'''
     <div class="fx-strip">
@@ -331,15 +428,15 @@ st.markdown(
         <div class="fx-line"><span class="fx-value">{fmt_pct(brecha)}</span></div>
       </div>
     </div>
-    <div class="updated">Actualizado: {updated_at.strftime('%d/%m/%Y · %H:%M')}</div>
+    <div class="updated">{('Último dato válido' if using_stale else 'Actualizado')}: {(updated_at.strftime('%d/%m/%Y · %H:%M') if updated_at else 'sin datos válidos')}</div>
     ''',
     unsafe_allow_html=True,
 )
 
-if all_live:
-    st.success('Datos conectados a fuentes en vivo.')
+if using_stale:
+    st.warning('Una o más consultas actuales fallaron. Se conserva el último dato válido y la hora no se adelanta artificialmente.')
 else:
-    st.info('Modo V1 híbrido: las fuentes disponibles se consultan en vivo; donde no hay un endpoint público estable se muestran los valores de validación. La app identifica esta condición para evitar presentar un fallback como dato en vivo.')
+    st.success('Datos de mercado obtenidos correctamente. No se utilizan precios fijos de demostración.')
 
 st.subheader('Top 20 CEDEARs por liquidez')
 
