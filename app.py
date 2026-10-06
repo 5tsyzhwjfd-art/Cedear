@@ -16,6 +16,7 @@ st.set_page_config(page_title='CEDEAR Monitor', page_icon='📈', layout='wide')
 # Configuration
 # -----------------------------
 REFRESH_SECONDS = 30 * 60
+# Market requests are intentionally not cached: each app rerun performs a fresh query.
 TZ = ZoneInfo('America/Argentina/Buenos_Aires')
 
 # Ratios validated for the initial prototype.
@@ -41,7 +42,8 @@ INSTRUMENTS = {
 # No fixed market-price fallbacks: stale demo prices can be mistaken for live data.
 # Last valid observations are retained instead.
 FALLBACK = {
-    'ccl': {'price': 1623.00, 'change': 0.65},
+    # Solo se usa si nunca hubo una lectura CCL válida. No participa de la validación normal.
+    'ccl': {'price': 1623.00, 'change': None},
     'official': {'price': 1400.00},
 }
 
@@ -64,7 +66,6 @@ def pct_change_from_prices(current, previous):
     return (current / previous - 1) * 100
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_usa_market_snapshot():
     """Secondary USA feed from Data912. One request covers the supported universe."""
     try:
@@ -120,7 +121,6 @@ def get_usa_quote(symbol, usa_snapshot=None):
     return None, None, 'Sin dato USA', False
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_official_fx():
     """Try ArgentinaDatos/BCRA-compatible public data; otherwise fallback."""
     endpoints = [
@@ -140,16 +140,103 @@ def get_official_fx():
     return FALLBACK['official']['price'], 'Fallback validación', False
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_ccl_reference():
-    """V1: stable fallback/reference. Replaceable adapter for BYMA feed in V2."""
-    # BYMA's public web presentation is not exposed here as a stable documented
-    # free JSON API. We keep this adapter isolated so it can be swapped without
-    # touching any financial calculations or UI.
-    return FALLBACK['ccl']['price'], FALLBACK['ccl']['change'], 'BYMA referencia validada', False
+def _mid_from_quote(data):
+    """Valor representativo de una cotización compra/venta."""
+    buy = data.get('compra')
+    sell = data.get('venta')
+    try:
+        buy = float(buy) if buy is not None else None
+        sell = float(sell) if sell is not None else None
+    except (TypeError, ValueError):
+        return None
+    if buy and sell:
+        return (buy + sell) / 2
+    return sell or buy
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def get_ccl_reference(store, now_iso):
+    """
+    CCL validado con 3 fuentes: DólarHoy (DolarAPI), Ámbito y Data912.
+    Se toma la mediana de fuentes comparables y se descartan outliers >1,5%.
+    Si no hay al menos 2 fuentes válidas, conserva el último CCL validado.
+    """
+    observations = []
+
+    # 1) DolarAPI: su endpoint CCL declara como fuente a DólarHoy.
+    try:
+        data = safe_get_json('https://dolarapi.com/v1/dolares/contadoconliqui')
+        value = _mid_from_quote(data)
+        if value:
+            observations.append({'source': 'DólarHoy / DolarAPI', 'value': value, 'change': None})
+    except Exception:
+        pass
+
+    # 2) DolarAPI Ámbito: endpoint separado cuya fuente declarada es Ámbito Financiero.
+    try:
+        data = safe_get_json('https://dolarapi.com/v1/ambito/dolares/contadoconliqui')
+        value = _mid_from_quote(data)
+        change = data.get('variacion')
+        change = float(change) if change is not None else None
+        if value:
+            observations.append({'source': 'Ámbito', 'value': value, 'change': change})
+    except Exception:
+        pass
+
+    # 3) Data912: mediana del CCL_mark de los instrumentos de mayor volumen ARS.
+    # Usar varios pares evita que un CEDEAR/ADR puntual distorsione la referencia.
+    try:
+        data = safe_get_json('https://data912.com/live/ccl')
+        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
+        valid = []
+        for x in items:
+            try:
+                mark = float(x.get('CCL_mark'))
+                volume = float(x.get('ars_volume', 0) or 0)
+                if mark > 0:
+                    valid.append((volume, mark))
+            except (TypeError, ValueError):
+                continue
+        if valid:
+            top_marks = [m for _, m in sorted(valid, reverse=True)[:10]]
+            value = float(pd.Series(top_marks).median())
+            observations.append({'source': 'Data912 CCL', 'value': value, 'change': None})
+    except Exception:
+        pass
+
+    if observations:
+        raw_median = float(pd.Series([x['value'] for x in observations]).median())
+        accepted = [x for x in observations if abs(x['value'] / raw_median - 1) <= 0.015]
+    else:
+        accepted = []
+
+    # Exigimos consenso de al menos dos fuentes para reemplazar el último valor válido.
+    if len(accepted) >= 2:
+        ccl = float(pd.Series([x['value'] for x in accepted]).median())
+        changes = [x['change'] for x in accepted if x['change'] is not None]
+        old = store.get('fx', {}).get('ccl', {})
+        if changes:
+            ccl_change = float(pd.Series(changes).median())
+        elif old.get('price'):
+            ccl_change = pct_change_from_prices(ccl, float(old['price']))
+        else:
+            ccl_change = None
+        store.setdefault('fx', {})['ccl'] = {
+            'price': ccl, 'change': ccl_change, 'timestamp': now_iso,
+            'sources': observations, 'accepted': [x['source'] for x in accepted],
+        }
+        source = 'Mediana validada: ' + ' + '.join(x['source'] for x in accepted)
+        return ccl, ccl_change, source, True, observations, now_iso
+
+    # Fallo/discordancia: no adelantar fecha ni sustituir por el viejo 1623 fijo.
+    old = store.get('fx', {}).get('ccl', {})
+    if old.get('price') is not None:
+        return (float(old['price']), old.get('change'), 'Último CCL validado', False,
+                observations, old.get('timestamp'))
+
+    return (FALLBACK['ccl']['price'], FALLBACK['ccl']['change'],
+            'Fallback inicial (sin consenso CCL)', False, observations, None)
+
+
 def get_local_market_snapshot():
     try:
         data = safe_get_json('https://data912.com/live/arg_cedears')
@@ -159,7 +246,6 @@ def get_local_market_snapshot():
         return {}
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_cedear_yahoo_quote(symbol):
     """Independent local backup via Yahoo's Buenos Aires (.BA) listing."""
     try:
@@ -186,7 +272,6 @@ def get_cedear_yahoo_quote(symbol):
     return None, None
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_cedear_historical_last(symbol):
     """Secondary local source: last available historical CEDEAR close from Data912."""
     try:
@@ -238,16 +323,21 @@ def recover_quote(store, market, symbol):
 
 
 def build_dashboard():
-    ccl, ccl_change, ccl_source, ccl_live = get_ccl_reference()
+    store = load_last_good()
+    now = datetime.now(TZ)
+    now_iso = now.isoformat()
+    ccl, ccl_change, ccl_source, ccl_live, ccl_observations, ccl_ts = get_ccl_reference(store, now_iso)
     official, official_source, official_live = get_official_fx()
     rows = []
     market = get_local_market_snapshot()
     usa_snapshot = get_usa_market_snapshot()
-    store = load_last_good()
-    now = datetime.now(TZ)
-    now_iso = now.isoformat()
     displayed_timestamps = []
-    using_stale = False
+    using_stale = not ccl_live
+    if ccl_ts:
+        try:
+            displayed_timestamps.append(datetime.fromisoformat(ccl_ts))
+        except Exception:
+            pass
 
     ranked = sorted(
         INSTRUMENTS.items(),
@@ -276,19 +366,25 @@ def build_dashboard():
             cedear, cedear_change = None, None
         cedear_source = 'Data912 live' if cedear is not None else 'Sin dato local'
         cedear_ts = None
+        current_cedear_observation = cedear is not None
         if cedear is None:
             yahoo_local, yahoo_local_change = get_cedear_yahoo_quote(symbol)
             if yahoo_local is not None:
                 cedear, cedear_change = yahoo_local, yahoo_local_change
                 cedear_source = 'Yahoo Finance .BA'
+                current_cedear_observation = True
         if cedear is None:
             hist_price, hist_change = get_cedear_historical_last(symbol)
             if hist_price is not None:
                 cedear, cedear_change = hist_price, hist_change
                 cedear_source = 'Data912 histórico'
-        if cedear is not None:
+                current_cedear_observation = False
+        if cedear is not None and current_cedear_observation:
             remember_quote(store, 'cedear', symbol, cedear, cedear_change, cedear_source, now_iso)
             cedear_ts = now_iso
+        elif cedear is not None:
+            _, _, _, cedear_ts = recover_quote(store, 'cedear', symbol)
+            using_stale = True
         else:
             cedear, cedear_change, old_source, cedear_ts = recover_quote(store, 'cedear', symbol)
             if cedear is not None:
@@ -323,7 +419,7 @@ def build_dashboard():
     # Conservative global timestamp: oldest observation currently used in the table.
     # It never advances merely because Streamlit reran; only a successful market observation changes it.
     data_timestamp = min(displayed_timestamps) if displayed_timestamps else None
-    return pd.DataFrame(rows), ccl, ccl_change, official, ccl_source, official_source, using_stale, data_timestamp
+    return pd.DataFrame(rows), ccl, ccl_change, official, ccl_source, official_source, using_stale, data_timestamp, ccl_observations
 
 
 def fmt_ars(x):
@@ -397,10 +493,9 @@ with left:
     st.caption('Comparación objetiva entre CEDEARs y sus activos subyacentes en EE.UU.')
 with right:
     if st.button('↻ Actualizar ahora', use_container_width=True):
-        st.cache_data.clear()
         st.rerun()
 
-df, ccl, ccl_change, official, ccl_source, official_source, using_stale, data_timestamp = build_dashboard()
+df, ccl, ccl_change, official, ccl_source, official_source, using_stale, data_timestamp, ccl_observations = build_dashboard()
 brecha = (ccl / official - 1) * 100 if official else None
 
 # Compact FX header: three indicators on one row, timestamp below.
@@ -501,6 +596,19 @@ with st.expander('Cómo se calculan las métricas'):
 ''')
 
 with st.expander('Diagnóstico de fuentes'):
+    st.markdown('**Validación CCL**')
+    if ccl_observations:
+        ccl_diag = pd.DataFrame([
+            {'Fuente': x['source'], 'CCL observado': x['value'],
+             'Diferencia vs usado': (x['value'] / ccl - 1) * 100 if ccl else None}
+            for x in ccl_observations
+        ])
+        st.dataframe(ccl_diag, hide_index=True, use_container_width=True)
+    else:
+        st.caption('No respondió ninguna fuente CCL en esta actualización.')
+    st.caption(f'CCL utilizado: {fmt_ars(ccl)} · {ccl_source}')
+
+    st.markdown('**Fuentes de mercado por CEDEAR**')
     diag = df[['CEDEAR', '_source_usa', '_source_cedear', '_live']].rename(columns={
         '_source_usa': 'Fuente USA', '_source_cedear': 'Fuente CEDEAR', '_live': 'Ambas en vivo'
     })
